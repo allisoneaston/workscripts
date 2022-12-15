@@ -13,9 +13,12 @@ import sys
 
 from common import async_start_shell_command
 from locust import User, constant_pacing, events, tag, task
+import locust.stats
 from pymongo import MongoClient, ReadPreference
 from random import randrange
 from time import perf_counter_ns
+
+locust.stats.CSV_STATS_INTERVAL_SEC = 10
 
 connection_string = None
 mongo_client = None
@@ -35,10 +38,10 @@ def on_locust_init(environment, **kwargs):
 
     global mongo_client
     mongo_client = MongoClient(connection_string)
-    database = mongo_client['MDBW22']
+    database = mongo_client['DefragmentationTest']
 
     global collection
-    collection = database.get_collection('BalancerDemo', read_preference=ReadPreference.PRIMARY)
+    collection = database.get_collection('coll', read_preference=ReadPreference.PRIMARY)
 
 
 class Mongouser(User):
@@ -50,7 +53,8 @@ class Mongouser(User):
 
     def _switch_account_id(self):
         # TODO: Use a natural number query instead
-        self.account_id = randrange(0, 350000000)
+        # self.account_id = randrange(0, 9999)
+        self.account_id = randrange(0, 231312999)
 
     @task(60)
     def find_account(self):
@@ -108,7 +112,7 @@ async def main(args):
     coordinator_command = (
         f'locust -f {__file__} --master --master-bind-port {args.coordinator_port} '
         f'--users {args.users} --spawn-rate 100 --autostart '
-        f'--web-port {args.web_port} '
+        f'--web-port {args.web_port} --csv=test_output_data --csv-full-history '
         f'--host {args.host} ')
     logging.info(coordinator_command)
     tasks.append(

@@ -33,13 +33,6 @@ def fmt_bytes(num):
     return f"{num:.1f}Yi{suffix}"
 
 
-def chunk_size_desc():
-    if args.chunk_size_min == args.chunk_size_max:
-        return fmt_bytes(args.chunk_size_min)
-    else:
-        return f'[min: {fmt_bytes(args.chunk_size_min)}, max: {fmt_bytes(args.chunk_size_max)}]'
-
-
 async def main(args):
     cluster = Cluster(args.uri, asyncio.get_event_loop())
     await cluster.check_is_mongos(warn_only=False)
@@ -48,7 +41,7 @@ async def main(args):
     shard_collection = ShardCollectionUtil(
         args.ns,
         uuid=uuid.uuid4(),
-        shard_key={'shardKey': 1},
+        shard_key={'account_id': 1, 'account_sub_id': 1},
         unique=True,
         fcv=await cluster.FCV,
     )
@@ -62,8 +55,6 @@ async def main(args):
         f'Placing {args.num_chunks} chunks over {shardIds} for collection {args.ns} with a shard key of {args.shard_key_type}'
     )
 
-    logging.info(f'Chunk size: {chunk_size_desc()}, document size: {fmt_bytes(args.doc_size)}')
-
     uuid_shard_key_byte_order = None
     if args.shard_key_type == 'uuid-little':
         uuid_shard_key_byte_order = 'little'
@@ -71,6 +62,7 @@ async def main(args):
     elif args.shard_key_type == 'uuid-big':
         uuid_shard_key_byte_order = 'big'
         logging.info(f'Will use {uuid_shard_key_byte_order} byte order for generating UUIDs')
+    oid = args.shard_key_type == 'oid'
 
     logging.info(f'Cleaning up old entries for {args.ns} ...')
     dbName, collName = args.ns.split('.', 1)
@@ -107,7 +99,8 @@ async def main(args):
                 'createIndexes': ns['coll'],
                 'indexes': [{
                     'key': {
-                        'shardKey': 1
+                        'account_id': 1,
+                        'account_sub_id': 1
                     },
                     'name': 'Shard key index'
                 }]
@@ -126,6 +119,8 @@ async def main(args):
         def make_shard_key(i):
             if uuid_shard_key_byte_order:
                 return uuid.UUID(bytes=i.to_bytes(16, byteorder=uuid_shard_key_byte_order))
+            elif oid:
+                return bson.objectid.ObjectId(i.to_bytes(12, byteorder='big'))
             else:
                 return i
 
@@ -145,10 +140,12 @@ async def main(args):
                     **obj,
                     **{
                         'min': {
-                            'shardKey': bson.min_key.MinKey
+                            'account_id': bson.min_key.MinKey,
+                            'account_sub_id': bson.min_key.MinKey
                         },
                         'max': {
-                            'shardKey': make_shard_key(i * 10000)
+                            'account_id': make_shard_key(i * 10000),
+                            'account_sub_id': bson.min_key.MinKey
                         },
                     }
                 }
@@ -157,10 +154,12 @@ async def main(args):
                     **obj,
                     **{
                         'min': {
-                            'shardKey': make_shard_key((i - 1) * 10000)
+                            'account_id': make_shard_key((i - 1) * 10000),
+                            'account_sub_id': bson.min_key.MinKey
                         },
                         'max': {
-                            'shardKey': bson.max_key.MaxKey
+                            'account_id': bson.max_key.MaxKey,
+                            'account_sub_id': bson.max_key.MaxKey
                         },
                     }
                 }
@@ -169,45 +168,25 @@ async def main(args):
                     **obj,
                     **{
                         'min': {
-                            'shardKey': make_shard_key((i - 1) * 10000)
+                            'account_id': make_shard_key((i - 1) * 10000),
+                            'account_sub_id': bson.min_key.MinKey
                         },
                         'max': {
-                            'shardKey': make_shard_key(i * 10000)
+                            'account_id': make_shard_key(i * 10000),
+                            'account_sub_id': bson.min_key.MinKey
                         }
                     }
                 }
 
             yield obj
 
-    def generate_shard_data_inserts(chunks_subset):
-        chunk_size = random.randint(args.chunk_size_min, args.chunk_size_max)
-        doc_size = args.doc_size
-        num_of_docs_per_chunk = chunk_size // doc_size
-        long_string = 'X' * math.ceil(doc_size / 2)
-
-        for c in chunks_subset:
-            minKey = c['min'][
-                'shardKey'] if c['min']['shardKey'] is not bson.min_key.MinKey else minInteger
-            maxKey = c['max'][
-                'shardKey'] if c['max']['shardKey'] is not bson.max_key.MaxKey else maxInteger
-
-            gap = ((maxKey - minKey) // (num_of_docs_per_chunk + 1))
-            key = minKey
-            for i in range(num_of_docs_per_chunk):
-                yield {'shardKey': key, long_string: long_string}
-                key += gap
-                assert key < maxKey, f'key: {key}, maxKey: {maxKey}'
 
     async def safe_write_chunks(shard, chunks_subset, progress):
         async with sem:
             write_chunks_entries = asyncio.ensure_future(
                 cluster.configDb.chunks.insert_many(chunks_subset, ordered=False))
 
-            write_data = asyncio.ensure_future(shard_connections[shard].get_database(
-                ns['db'])[ns['coll']].insert_many(
-                    generate_shard_data_inserts(chunks_subset), ordered=False))
-
-            await asyncio.gather(write_chunks_entries, write_data)
+            await write_chunks_entries
             progress.update(len(chunks_subset))
 
     with tqdm(total=args.num_chunks, unit=' chunks') as progress:
@@ -254,12 +233,7 @@ if __name__ == "__main__":
                             dest='num_chunks', type=int)
     argsParser.add_argument('--shard-key-type', help='The type to use for a shard key',
                             dest='shard_key_type', type=str,
-                            choices=['integer', 'uuid-little', 'uuid-big'], default='integer')
-    argsParser.add_argument('--chunk-size-kb', help='Final chunk size (in KiB)', dest='chunk_size',
-                            type=lambda x: kb_to_bytes(x), nargs='+',
-                            default=[kb_to_bytes(16), kb_to_bytes(32)])
-    argsParser.add_argument('--doc-size-kb', help='Size of the generated documents (in KiB)',
-                            dest='doc_size', type=lambda x: kb_to_bytes(x), default=kb_to_bytes(8))
+                            choices=['integer', 'uuid-little', 'uuid-big', 'oid'], default='integer')
     argsParser.add_argument(
         '--fragmentation',
         help="""A number between 0 and 1 indicating the level of fragmentation of the chunks. The
@@ -273,21 +247,6 @@ if __name__ == "__main__":
     logging.info(f"Starting with parameters: '{list}'")
 
     args = argsParser.parse_args()
-
-    if len(args.chunk_size) == 1:
-        args.chunk_size_min = args.chunk_size_max = args.chunk_size[0]
-    elif len(args.chunk_size) == 2:
-        args.chunk_size_min = args.chunk_size[0]
-        args.chunk_size_max = args.chunk_size[1]
-    else:
-        raise Exception(f'Too many chunk sizes values provided, maximum 2 allowed')
-
-    del args.chunk_size
-
-    if args.doc_size > min(args.chunk_size_min, args.chunk_size_max):
-        raise Exception(
-            f'''Specified document size is too big. It needs to be smaller than the chunk size: '''
-            f'''Doc size : {fmt_bytes(args.doc_size)}, Chunk size: {chunk_size_desc()}''')
 
     loop = asyncio.get_event_loop()
     loop.run_until_complete(main(args))
