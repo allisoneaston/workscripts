@@ -1,0 +1,25 @@
+[
+ {
+    "database": "DefragmentationTest",
+    "collection": "coll",
+    "count": 350000001,
+    "content": {
+        "account_id": {
+            "type": "autoincrement",
+            "autoType": "int",
+            "start": 0
+        },
+        "account_sub_id": {
+            "type": "constant",
+            "constVal": 0
+        },
+        "modifications": {
+            "type": "constant",
+            "constVal": 1
+        },
+        "shardKey": {
+            "type": "int"
+        } 
+    }
+ }
+]
